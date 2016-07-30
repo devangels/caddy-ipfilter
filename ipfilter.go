@@ -117,28 +117,38 @@ func Setup(c *caddy.Controller) error {
 	return nil
 }
 
-func getClientIP(r *http.Request, strict bool) (net.IP, error) {
-	var ip string
+func getClientIPs(r *http.Request, strict bool) ([]net.IP, error) {
+	var ips []string
 
-	// Use the client ip from the 'X-Forwarded-For' header, if available.
+	// Use the client ip(s) from the 'X-Forwarded-For' header, if available.
 	if fwdFor := r.Header.Get("X-Forwarded-For"); fwdFor != "" && !strict {
-		ip = fwdFor
+		ips = strings.Split(fwdFor, ",")
 	} else {
 		// Otherwise, get the client ip from the request remote address.
 		var err error
+		var ip string
 		ip, _, err = net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			return nil, err
 		}
+		ips = []string{ip}
 	}
 
-	// Parse the ip address string into a net.IP.
-	parsedIP := net.ParseIP(ip)
-	if parsedIP == nil {
+	// Parse each ip address string into a net.IP.
+	var parsedIPs = make([]net.IP, len(ips))
+	var count = 0
+	for _, ip := range ips {
+		parsedIP := net.ParseIP(strings.TrimSpace(ip))
+		if parsedIP != nil {
+			parsedIPs[count] = parsedIP
+			count++
+		}
+	}
+	if count == 0 {
 		return nil, errors.New("unable to parse address")
 	}
 
-	return parsedIP, nil
+	return parsedIPs, nil
 }
 
 // ShouldAllow takes a path and a request and decides if it should be allowed
@@ -149,8 +159,8 @@ func (ipf IPFilter) ShouldAllow(path IPPath, r *http.Request) (bool, string, err
 	// check if we are in one of our scopes.
 	for _, scope := range path.PathScopes {
 		if httpserver.Path(r.URL.Path).Matches(scope) {
-			// extract the client's IP and parse it.
-			clientIP, err := getClientIP(r, path.Strict)
+			// extract the client IP(s) and parse them.
+			clientIPs, err := getClientIPs(r, path.Strict)
 			if err != nil {
 				return false, scope, err
 			}
@@ -161,15 +171,20 @@ func (ipf IPFilter) ShouldAllow(path IPPath, r *http.Request) (bool, string, err
 			if len(path.CountryCodes) != 0 {
 				// do the lookup.
 				var result OnlyCountry
-				if err = ipf.Config.DBHandler.Lookup(clientIP, &result); err != nil {
-					return false, scope, err
-				}
+				for _, clientIP := range clientIPs {
+					if err = ipf.Config.DBHandler.Lookup(clientIP, &result); err != nil {
+						return false, scope, err
+					}
 
-				// get only the ISOCode out of the lookup results.
-				clientCountry := result.Country.ISOCode
-				for _, c := range path.CountryCodes {
-					if clientCountry == c {
-						rs.countryMatch = true
+					// get only the ISOCode out of the lookup results.
+					clientCountry := result.Country.ISOCode
+					for _, c := range path.CountryCodes {
+						if clientCountry == c {
+							rs.countryMatch = true
+							break
+						}
+					}
+					if rs.countryMatch {
 						break
 					}
 				}
@@ -177,8 +192,13 @@ func (ipf IPFilter) ShouldAllow(path IPPath, r *http.Request) (bool, string, err
 
 			if len(path.Ranges) != 0 {
 				for _, rng := range path.Ranges {
-					if rng.InRange(&clientIP) {
-						rs.inRange = true
+					for _, clientIP := range clientIPs {
+						if rng.InRange(&clientIP) {
+							rs.inRange = true
+							break
+						}
+					}
+					if rs.inRange {
 						break
 					}
 				}
